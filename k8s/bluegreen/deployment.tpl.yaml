@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp-__COLOR__
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: webapp, track: __COLOR__}
+  template:
+    metadata:
+      labels: {app: webapp, track: __COLOR__}
+    spec:
+      containers:
+        - name: app
+          image: docker.io/your-user/healthapp:0.0.0
+          ports: [{containerPort: 5000}]
+          env:
+            - {name: APP_COLOR, value: "__COLOR__"}
+            - {name: APP_VERSION, value: "__VERSION__"}
+          readinessProbe:
+            httpGet: {path: /health, port: 5000}
+            initialDelaySeconds: 3
+            periodSeconds: 5

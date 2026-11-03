@@ -1,0 +1,109 @@
+def point(String svc, String color) {
+  sh "kubectl patch svc ${svc} --type=merge -p '{\"spec\":{\"selector\":{\"app\":\"webapp\",\"track\":\"${color}\"}}}'"
+}
+def liveColor() {
+  return sh(returnStdout: true, script: "kubectl get svc webapp-live -o jsonpath='{.spec.selector.track}'").trim()
+}
+
+pipeline {
+  agent any
+  options { timestamps(); disableConcurrentBuilds() }
+  parameters {
+    choice(name: 'ACTION', choices: ['DEPLOY', 'ROLLBACK'], description: 'Deploy new version to idle color, or switch back')
+    booleanParam(name: 'ASK_APPROVAL', defaultValue: true, description: 'Pause before switching traffic')
+  }
+  environment {
+    IMAGE_REPO = 'prady200545/healthapp'
+    TAG        = "${BUILD_NUMBER}"
+    KUBECONFIG = '/var/lib/jenkins/.kube/config'
+  }
+  stages {
+    stage('Checkout') { steps { checkout scm } }
+
+    stage('Build and push') {
+      when { expression { params.ACTION == 'DEPLOY' } }
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+          sh '''
+            docker build -t $IMAGE_REPO:$TAG .
+            echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+            docker push $IMAGE_REPO:$TAG
+            docker logout
+          '''
+        }
+      }
+    }
+
+    stage('Deploy to idle color') {
+      when { expression { params.ACTION == 'DEPLOY' } }
+      steps {
+        script {
+          sh 'kubectl get svc webapp-live || kubectl apply -f k8s/bluegreen/service.yaml'
+          env.LIVE = liveColor()
+          env.IDLE = (env.LIVE == 'blue') ? 'green' : 'blue'
+          echo "LIVE=${env.LIVE}  ->  deploying to IDLE=${env.IDLE}"
+          sh '''
+            sed -e "s|__COLOR__|$IDLE|g" -e "s|__VERSION__|build-$TAG|" \
+                -e "s|docker.io/your-user/healthapp:0.0.0|docker.io/$IMAGE_REPO:$TAG|" \
+                k8s/bluegreen/deployment.tpl.yaml | kubectl apply -f -
+            kubectl rollout status deployment/webapp-$IDLE --timeout=120s
+          '''
+          point('webapp-preview', env.IDLE)
+        }
+      }
+    }
+
+    stage('Smoke test idle color') {
+      when { expression { params.ACTION == 'DEPLOY' } }
+      steps {
+        sh '''kubectl exec deploy/webapp-$IDLE -- python -c "import urllib.request as u; assert u.urlopen('http://127.0.0.1:5000/health', timeout=3).status == 200"'''
+      }
+    }
+
+    stage('Approval') {
+      when { expression { params.ACTION == 'DEPLOY' && params.ASK_APPROVAL } }
+      steps {
+        timeout(time: 10, unit: 'MINUTES') {
+          input message: "Check the new version on port 30091. Switch live traffic to ${env.IDLE}?"
+        }
+      }
+    }
+
+    stage('Switch traffic') {
+      when { expression { params.ACTION == 'DEPLOY' } }
+      steps {
+        script {
+          point('webapp-live', env.IDLE)
+          point('webapp-preview', env.LIVE)
+          env.SWITCHED = 'true'
+        }
+      }
+    }
+
+    stage('Verify live') {
+      when { expression { params.ACTION == 'DEPLOY' } }
+      steps { sh 'curl --retry 10 --retry-connrefused --retry-delay 3 -fsS http://localhost:30090/health | grep "\\"color\\":\\"$IDLE\\""' }
+    }
+
+    stage('Rollback') {
+      when { expression { params.ACTION == 'ROLLBACK' } }
+      steps {
+        script {
+          def live = liveColor()
+          def target = (live == 'blue') ? 'green' : 'blue'
+          sh "kubectl get deploy webapp-${target}"
+          point('webapp-live', target)
+          point('webapp-preview', live)
+          echo "Rolled back: live is now ${target}"
+        }
+      }
+    }
+  }
+  post {
+    failure {
+      script {
+        if (env.SWITCHED == 'true') { point('webapp-live', env.LIVE); point('webapp-preview', env.IDLE) }
+      }
+    }
+  }
+}
