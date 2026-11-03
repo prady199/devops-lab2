@@ -16,7 +16,7 @@ PATIENTS = [  # synthetic data only
 @app.get("/")
 def home():
     bg = BG.get(COLOR, "#374151")
-    return (f'<body bgcolor="{bg}" text="white"><h1>HealthApp {COLOR.upper()}</h1>'
+    return (f'<body bgcolor="{bg}" text="white"><h1>HealthApp v2 {COLOR.upper()}</h1>'
             f'<h2>version {VERSION}</h2><p>pod {socket.gethostname()}</p></body>')
 
 @app.get("/health")
