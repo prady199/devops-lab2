@@ -1,0 +1,49 @@
+pipeline {
+  agent any
+  options { timestamps(); disableConcurrentBuilds() }
+  environment {
+    IMAGE_REPO = 'prady200545/healthapp'
+    TAG        = "${BUILD_NUMBER}"
+    KUBECONFIG = '/var/lib/jenkins/.kube/config'
+  }
+  stages {
+    stage('Checkout') { steps { checkout scm } }
+    stage('Unit tests') {
+      steps {
+        sh '''
+          python3 -m venv .venv && . .venv/bin/activate
+          pip install -q -r app/requirements.txt pytest
+          cd app && python -m pytest -q
+        '''
+      }
+    }
+    stage('Build image') { steps { sh 'docker build -t $IMAGE_REPO:$TAG .' } }
+    stage('Push image') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+          sh '''
+            echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+            docker push $IMAGE_REPO:$TAG
+            docker logout
+          '''
+        }
+      }
+    }
+    stage('Deploy to Kubernetes') {
+      steps {
+        sh '''
+          sed -e "s|docker.io/your-user/healthapp:0.0.0|docker.io/$IMAGE_REPO:$TAG|" \
+              -e "s|__VERSION__|build-$TAG|" k8s/cicd/deployment.yaml | kubectl apply -f -
+          kubectl rollout status deployment/healthapp --timeout=120s
+        '''
+        script { env.DEPLOYED = 'true' }
+      }
+    }
+    stage('Smoke test') {
+      steps { sh 'curl --retry 10 --retry-connrefused --retry-delay 3 -fsS http://localhost:30080/health' }
+    }
+  }
+  post {
+    failure { script { if (env.DEPLOYED == 'true') sh 'kubectl rollout undo deployment/healthapp' } }
+  }
+}
