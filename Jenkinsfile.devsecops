@@ -1,0 +1,91 @@
+pipeline {
+  agent any
+  options { timestamps(); disableConcurrentBuilds() }
+  environment {
+    IMAGE_REPO = 'prady200545/healthapp'
+    TAG        = "${BUILD_NUMBER}"
+    KUBECONFIG = '/var/lib/jenkins/.kube/config'
+  }
+  stages {
+    stage('Checkout') { steps { checkout scm } }
+
+    stage('1. Secret scan') {
+      steps { sh 'trivy fs --scanners secret --exit-code 1 --skip-dirs .venv --skip-dirs .git .' }
+    }
+    stage('2. SAST - Bandit') {
+      steps {
+        sh '''
+          python3 -m venv .venv && . .venv/bin/activate
+          pip install -q bandit
+          bandit -r app/app.py -ll
+        '''
+      }
+    }
+    stage('3. SCA - dependencies') {
+      steps { sh 'trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --skip-dirs .venv --skip-dirs .git app' }
+    }
+    stage('4. Unit tests') {
+      steps {
+        sh '''
+          . .venv/bin/activate
+          pip install -q -r app/requirements.txt pytest
+          cd app && python -m pytest -q
+        '''
+      }
+    }
+    stage('5. IaC and Dockerfile scan') {
+      steps { sh 'trivy config --severity HIGH,CRITICAL --exit-code 1 --skip-dirs .venv --skip-dirs .git --skip-dirs k8s/cicd --skip-dirs k8s/bluegreen .' }
+    }
+    stage('6. Build image') { steps { sh 'docker build --pull -t $IMAGE_REPO:$TAG .' } }
+    stage('7. Image scan') {
+      steps { sh 'trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 $IMAGE_REPO:$TAG' }
+    }
+    stage('8. Push image') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+          sh '''
+            echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+            docker push $IMAGE_REPO:$TAG
+            docker logout
+          '''
+        }
+      }
+    }
+    stage('9. Deploy securely') {
+      steps {
+        withCredentials([string(credentialsId: 'api-token', variable: 'API_TOKEN'),
+                         string(credentialsId: 'login-password', variable: 'LOGIN_PASSWORD')]) {
+          sh '''
+            kubectl apply -f k8s/secure/namespace.yaml
+            kubectl -n healthcare create secret generic app-secrets \
+              --from-literal=api-token="$API_TOKEN" \
+              --from-literal=login-password="$LOGIN_PASSWORD" \
+              --from-literal=secret-key="$(openssl rand -hex 32)" \
+              --dry-run=client -o yaml | kubectl apply -f -
+            sed -e "s|docker.io/your-user/healthapp:0.0.0|docker.io/$IMAGE_REPO:$TAG|" -e "s|__VERSION__|build-$TAG|" k8s/secure/deployment.yaml | kubectl apply -f -
+            kubectl -n healthcare rollout status deployment/healthapp --timeout=150s
+          '''
+        }
+      }
+    }
+    stage('10. Security smoke tests') {
+      steps {
+        withCredentials([string(credentialsId: 'api-token', variable: 'API_TOKEN'),
+                         string(credentialsId: 'login-password', variable: 'LOGIN_PASSWORD')]) {
+          sh '''
+            curl --retry 10 --retry-connrefused --retry-delay 3 -fsS http://localhost:30100/health; echo
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:30100/patients)
+            [ "$code" = "401" ] || { echo "FAIL: /patients without token returned $code"; exit 1; }
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $API_TOKEN" http://localhost:30100/patients)
+            [ "$code" = "200" ] || { echo "FAIL: /patients with token returned $code"; exit 1; }
+            code=$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode "username=doctor" --data-urlencode "password=wrong" http://localhost:30100/login)
+            [ "$code" = "401" ] || { echo "FAIL: wrong password returned $code"; exit 1; }
+            code=$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode "username=doctor" --data-urlencode "password=$LOGIN_PASSWORD" http://localhost:30100/login)
+            [ "$code" = "302" ] || { echo "FAIL: correct login returned $code"; exit 1; }
+            echo "Access control checks passed"
+          '''
+        }
+      }
+    }
+  }
+}
