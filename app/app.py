@@ -77,7 +77,7 @@ th{background:#f8fafc;color:#475569}
 {% else %}
 <body class="auth"><main class="card">
  <div class="logo"><svg viewBox="0 0 24 24" width="30" height="30" fill="#fff"><path d="M10 3h4v7h7v4h-7v7h-4v-7H3v-4h7z"/></svg></div>
- <h1>HealthApp Patient Portal</h1><p class="sub">Sign in to continue</p>
+ <h1>HealthApp Patient Portal</h1><p class="sub">Sign in to continue - v2</p>
  {% if error %}<div class="err">{{ error }}</div>{% endif %}
  <form method="post" action="/login">
   <label for="u">Username</label>
